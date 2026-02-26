@@ -114,7 +114,7 @@ If you use Caddy as your reverse proxy, follow step 5.1. If you use Nginx, follo
 matrix-rtc.yourdomain.com {
     # This is matrix-rtc-jwt
     @jwt_service {
-        path /sfu/get* /healthz*
+        path /sfu/get* /healthz* /get_token*
     }
     handle @jwt_service {
         reverse_proxy localhost:8081
@@ -148,7 +148,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/matrix-rtc.yourdomain.com/privkey.pem;
 
     # lk-jwt-service
-    location ~ ^(/sfu/get|/healthz) {
+    location ~ ^/(sfu/get|healthz|get_token) {
         proxy_pass http://localhost:8081;
 
         proxy_set_header Host $host;
