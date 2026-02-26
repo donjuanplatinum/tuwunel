@@ -51,7 +51,7 @@ it.
 If the `docker run` command is not for you or your setup, you can also use one
 of the provided `docker-compose` files.
 
-Depending on your proxy setup, you can use one of the following files;
+Depending on your proxy setup, you can use one of the following files:
 
 - If you already have a `traefik` instance set up, use
 [`docker-compose.for-traefik.yml`](docker-compose.for-traefik.yml)
