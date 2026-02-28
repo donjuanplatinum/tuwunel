@@ -12,6 +12,7 @@ use super::{preview::UrlPreviewData, thumbnail::Dim};
 
 pub(crate) struct Data {
 	mediaid_file: Arc<Map>,
+	mediaid_pending: Arc<Map>,
 	mediaid_user: Arc<Map>,
 	url_previews: Arc<Map>,
 }
@@ -27,6 +28,7 @@ impl Data {
 	pub(super) fn new(db: &Arc<Database>) -> Self {
 		Self {
 			mediaid_file: db["mediaid_file"].clone(),
+			mediaid_pending: db["mediaid_pending"].clone(),
 			mediaid_user: db["mediaid_user"].clone(),
 			url_previews: db["url_previews"].clone(),
 		}
@@ -50,6 +52,114 @@ impl Data {
 		}
 
 		Ok(key.to_vec())
+	}
+
+	/// Insert a pending MXC URI into the database
+	pub(super) fn insert_pending_mxc(
+		&self,
+		mxc: &Mxc<'_>,
+		user: &UserId,
+		unused_expires_at: u64,
+	) {
+		let key = mxc.to_string();
+		tracing::info!(
+			"Inserting pending MXC: key={}, user={}, expires_at={}",
+			key,
+			user,
+			unused_expires_at
+		);
+		// 8 bytes for unused_expires_at (u64), 1 byte for 0xFF, and
+		// user.as_bytes().len() for user value: [unused_expires_at, 0xFF, user]
+		let mut value = Vec::with_capacity(user.as_bytes().len() + 9);
+		value.extend_from_slice(&unused_expires_at.to_be_bytes());
+		value.push(0xFF);
+		value.extend_from_slice(user.as_bytes());
+		self.mediaid_pending
+			.insert(key.as_bytes(), &value);
+	}
+
+	/// Count the number of pending MXC URIs for a specific user
+	pub(super) async fn count_pending_mxc_for_user(&self, user: &UserId) -> (usize, u64) {
+		let mut count = 0;
+		let mut earliest_expiration = u64::MAX;
+		let user_bytes = user.as_bytes();
+
+		self.mediaid_pending
+			.raw_stream()
+			.ignore_err()
+			.ready_for_each(|(_key, value)| {
+				let mut parts = value.splitn(2, |&b| b == 0xFF);
+				if let Some(expires_at_bytes) = parts.next() {
+					if let Some(user_id_bytes) = parts.next() {
+						if user_id_bytes == user_bytes {
+							count += 1;
+							let expires_at = u64::from_be_bytes(
+								expires_at_bytes.try_into().unwrap_or([0u8; 8]),
+							);
+							if expires_at < earliest_expiration {
+								earliest_expiration = expires_at;
+							}
+						}
+					}
+				}
+			})
+			.await;
+
+		(count, earliest_expiration)
+	}
+
+	/// Search for a pending MXC URI in the database
+	pub(super) async fn search_pending_mxc(
+		&self,
+		mxc: &Mxc<'_>,
+	) -> Option<(ruma::OwnedUserId, u64)> {
+		let key = mxc.to_string();
+		tracing::info!("Searching for pending MXC: key={}", key);
+		let value = match self.mediaid_pending.get(key.as_bytes()).await {
+			| Ok(v) => v,
+			| Err(e) => {
+				tracing::info!("pending MXC not found or error for {}: {}", key, e);
+				return None;
+			},
+		};
+		let mut parts = value.splitn(2, |&b| b == 0xFF);
+		// value: [expires_at, 0xFF, user]
+		let expires_at_bytes = parts.next()?;
+		let expires_at = match expires_at_bytes.try_into() {
+			| Ok(v) => u64::from_be_bytes(v),
+			| Err(_) => {
+				tracing::error!("Failed to parse expires_at for {}", key);
+				return None;
+			},
+		};
+		let user_id_bytes = parts.next()?;
+		let user_str = match str_from_bytes(user_id_bytes) {
+			| Ok(v) => v,
+			| Err(_) => {
+				tracing::error!("Failed to parse user_str for {}", key);
+				return None;
+			},
+		};
+		let user_id = match user_str.try_into() {
+			| Ok(v) => v,
+			| Err(e) => {
+				tracing::error!("Failed to parse user_id for {}: {}", key, e);
+				return None;
+			},
+		};
+
+		tracing::info!(
+			"Found pending MXC for {}: user={}, expires_at={}",
+			key,
+			user_id,
+			expires_at
+		);
+		Some((user_id, expires_at))
+	}
+
+	pub(super) fn remove_pending_mxc(&self, mxc: &Mxc<'_>) {
+		self.mediaid_pending
+			.remove(mxc.to_string().as_bytes());
 	}
 
 	pub(super) async fn delete_file_mxc(&self, mxc: &Mxc<'_>) {
