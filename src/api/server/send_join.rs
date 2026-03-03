@@ -15,10 +15,10 @@ use ruma::{
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
 	Err, Result, at, err,
-	matrix::event::gen_event_id_canonical_json,
+	matrix::{Event, event::gen_event_id_canonical_json},
 	utils::{
 		BoolExt,
-		stream::{BroadbandExt, IterStream, TryBroadbandExt},
+		stream::{BroadbandExt, IterStream, ReadyExt, TryBroadbandExt},
 	},
 	warn,
 };
@@ -203,16 +203,38 @@ async fn create_join_event(
 			.await
 			.ok();
 
+		// Fetch up to 5 heroes to include their member events
+		// MSC3706 / MSC3943: Heroes' member events should be included.
+		let heroes_ssks = services
+			.state_accessor
+			.room_state_type_pdus(room_id, &StateEventType::RoomMember)
+			.ready_filter_map(|r| r.ok())
+			.ready_filter_map(|pdu| pdu.state_key().map(|s| s.to_owned()))
+			.take(5)
+			.broad_filter_map(|u| async move {
+				services
+					.short
+					.get_shortstatekey(&StateEventType::RoomMember, u.as_str())
+					.await
+					.ok()
+			})
+			.collect::<Vec<_>>()
+			.await
+			.into_iter()
+			.collect::<HashSet<_>>();
+
 		state_ids
 			.clone()
 			.then(move |state| {
 				let joining_user_ssk = joining_user_shortstatekey;
+				let heroes_ssks = heroes_ssks;
 				async move {
 					state
 						.iter()
 						.stream()
 						.broad_filter_map(move |&(ssk, ref eid)| {
 							let joining_user_ssk = joining_user_ssk;
+							let heroes_ssks = heroes_ssks.clone();
 							let eid = eid.clone();
 							services
 								.short
@@ -220,11 +242,12 @@ async fn create_join_event(
 								.map(move |res| {
 									let keep = res
 										.map(|(et, _)| {
-											// Keep if not a member event or if it's the joining
-											// user's member event
+											// Keep if not a member event
 											et != StateEventType::RoomMember
 											// or if it's the joining user's member event
 												|| Some(ssk) == joining_user_ssk
+											// or if it's a room hero's member event
+												|| heroes_ssks.contains(&ssk)
 										})
 										.unwrap_or(true);
 
