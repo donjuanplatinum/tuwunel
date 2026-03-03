@@ -1,6 +1,6 @@
 #![expect(deprecated)]
 
-use std::borrow::Borrow;
+use std::{borrow::Borrow, collections::HashSet};
 
 use axum::extract::State;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, future::try_join4};
@@ -16,7 +16,7 @@ use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
 	Err, Result, at, err,
 	matrix::event::gen_event_id_canonical_json,
-	utils::stream::{IterStream, TryBroadbandExt},
+	utils::stream::{BroadbandExt, IterStream, TryBroadbandExt},
 	warn,
 };
 use tuwunel_service::Services;
@@ -29,6 +29,7 @@ async fn create_join_event(
 	origin: &ServerName,
 	room_id: &RoomId,
 	pdu: &RawJsonValue,
+	omit_members: bool,
 ) -> Result<create_join_event::v1::RoomState> {
 	if !services.metadata.exists(room_id).await {
 		return Err!(Request(NotFound("Room is unknown to this server.")));
@@ -188,9 +189,62 @@ async fn create_join_event(
 	let state_ids = services
 		.state_accessor
 		.state_full_ids(shortstatehash)
-		.map(at!(1))
-		.collect::<Vec<OwnedEventId>>()
-		.boxed();
+		.collect::<Vec<_>>()
+		.boxed()
+		.shared();
+	// Filter out members if omit_members is true
+	let filtered_state_ids = if omit_members {
+		let joining_user_shortstatekey = services
+			.short
+			.get_shortstatekey(&StateEventType::RoomMember, state_key.as_str())
+			.await
+			.ok();
+
+		state_ids
+			.clone()
+			.then(move |state| {
+				let joining_user_ssk = joining_user_shortstatekey;
+				async move {
+					state
+						.iter()
+						.stream()
+						.broad_filter_map(move |&(ssk, ref eid)| {
+							let joining_user_ssk = joining_user_ssk;
+							let eid = eid.clone();
+							services
+								.short
+								.get_statekey_from_short(ssk)
+								.map(move |res| {
+									let keep = res
+										.map(|(et, _)| {
+											// Keep if not a member event or if it's the joining
+											// user's member event
+											et != StateEventType::RoomMember
+											// or if it's the joining user's member event
+												|| Some(ssk) == joining_user_ssk
+										})
+										.unwrap_or(true);
+
+									keep.then_some(eid)
+								})
+						})
+						.collect::<Vec<OwnedEventId>>()
+						.await
+				}
+			})
+			.boxed()
+	} else {
+		state_ids
+			.clone()
+			.map(|state| {
+				state
+					.iter()
+					.map(|(_, eid)| eid)
+					.cloned()
+					.collect::<Vec<_>>()
+			})
+			.boxed()
+	};
 
 	let mutex_lock = services
 		.event_handler
@@ -219,7 +273,7 @@ async fn create_join_event(
 	let broadcast = services.sending.send_pdu_room(room_id, &pdu_id);
 
 	// Wait for state gather which the remaining operations depend on.
-	let state_ids = state_ids.await;
+	let state_ids = filtered_state_ids.await;
 	let auth_heads = state_ids.iter().map(Borrow::borrow);
 	let into_federation_format = |pdu| {
 		services
@@ -228,9 +282,24 @@ async fn create_join_event(
 			.map(Ok)
 	};
 
-	let auth_chain = services
+	// Get the auth chain for the new server.
+	let mut auth_chain_ids: HashSet<OwnedEventId> = services
 		.auth_chain
 		.event_ids_iter(room_id, &room_version, auth_heads)
+		.try_collect()
+		.await?;
+
+	// Remove member events from the auth chain if omit_members is true
+	if omit_members {
+		for id in &state_ids {
+			auth_chain_ids.remove(id);
+		}
+	}
+
+	let auth_chain = auth_chain_ids
+		.into_iter()
+		.stream()
+		.map(Ok::<_, tuwunel_core::Error>)
 		.broad_and_then(async |event_id| {
 			services
 				.timeline
@@ -284,7 +353,7 @@ pub(crate) async fn create_join_event_v1_route(
 	}
 
 	Ok(create_join_event::v1::Response {
-		room_state: create_join_event(&services, body.origin(), &body.room_id, &body.pdu)
+		room_state: create_join_event(&services, body.origin(), &body.room_id, &body.pdu, false)
 			.boxed()
 			.await?,
 	})
@@ -316,17 +385,31 @@ pub(crate) async fn create_join_event_v2_route(
 	}
 
 	let create_join_event::v1::RoomState { auth_chain, state, event } =
-		create_join_event(&services, body.origin(), &body.room_id, &body.pdu)
+		create_join_event(&services, body.origin(), &body.room_id, &body.pdu, body.omit_members)
 			.boxed()
 			.await?;
 
+	// Get the servers in the room if omit_members is true
+	let servers_in_room = if body.omit_members {
+		Some(
+			services
+				.state_cache
+				.room_servers(&body.room_id)
+				.map(|s| s.to_string())
+				.collect()
+				.await,
+		)
+	} else {
+		None
+	};
+
 	Ok(create_join_event::v2::Response {
 		room_state: create_join_event::v2::RoomState {
-			members_omitted: false,
+			members_omitted: body.omit_members,
 			auth_chain,
 			state,
 			event,
-			servers_in_room: None,
+			servers_in_room,
 		},
 	})
 }
