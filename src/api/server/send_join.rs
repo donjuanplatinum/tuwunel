@@ -395,7 +395,7 @@ pub(crate) async fn create_join_event_v2_route(
 			services
 				.state_cache
 				.room_servers(&body.room_id)
-				.map(|s| s.to_string())
+				.map(ToString::to_string)
 				.collect()
 				.await,
 		)
