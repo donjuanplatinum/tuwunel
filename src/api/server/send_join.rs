@@ -208,8 +208,8 @@ async fn create_join_event(
 		let heroes_ssks = services
 			.state_accessor
 			.room_state_type_pdus(room_id, &StateEventType::RoomMember)
-			.ready_filter_map(|r| r.ok())
-			.ready_filter_map(|pdu| pdu.state_key().map(|s| s.to_owned()))
+			.ready_filter_map(Result::ok)
+			.ready_filter_map(|pdu| pdu.state_key().map(ToOwned::to_owned))
 			.take(5)
 			.broad_filter_map(|u| async move {
 				services
