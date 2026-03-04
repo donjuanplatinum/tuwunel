@@ -15,7 +15,8 @@ use ruma::{
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
 	Err, Result, at, err,
-	matrix::event::gen_event_id_canonical_json,
+	itertools::Itertools,
+	matrix::{Event, event::gen_event_id_canonical_json},
 	utils::stream::{BroadbandExt, IterStream, TryBroadbandExt},
 	warn,
 };
@@ -205,21 +206,34 @@ async fn create_join_event(
 			.then(move |state| {
 				let joining_user_ssk = joining_user_ssk;
 				async move {
-					// Detect heroes from the members already in the room state
 					let heroes_ssks: HashSet<ShortStateKey> = state
 						.iter()
 						.stream()
-						.broad_filter_map(|&(ssk, _)| async move {
-							let (et, _) = services
-								.short
-								.get_statekey_from_short(ssk)
-								.await
-								.ok()?;
-							(et == StateEventType::RoomMember).then_some(ssk)
+						.broad_filter_map(|&(ssk, ref eid)| async move {
+							let (et, key) = services.short.get_statekey_from_short(ssk).await.ok()?;
+							if et != StateEventType::RoomMember {
+								return None;
+							}
+
+							// Only consider JOINED or INVITED members as heroes
+							let pdu = services.timeline.get_pdu(eid).await.ok()?;
+							let content: RoomMemberEventContent = serde_json::from_str(pdu.content().get()).ok()?;
+
+							if matches!(content.membership, MembershipState::Join | MembershipState::Invite) {
+								Some((ssk, key))
+							} else {
+								None
+							}
 						})
+						// Sort by MXID string to ensure deterministic selection across servers 
+						// (Synapse uses oldest first, but MXID sorting is a safe tiebreaker)
+						.collect::<Vec<_>>()
+						.await
+						.into_iter()
+						.sorted_by_key(|(_, key)| key.clone())
+						.map(|(ssk, _)| ssk)
 						.take(5)
-						.collect()
-						.await;
+						.collect();
 
 					state
 						.iter()
@@ -288,11 +302,7 @@ async fn create_join_event(
 	// Wait for state gather which the remaining operations depend on.
 	let state_ids = filtered_state_ids.await;
 
-	// Use both the filtered state and the new join event as auth heads.
-	// MSC3706 requires the auth chain of the join event itself to be included.
-	let mut auth_heads = state_ids.clone();
-	auth_heads.push(event_id.clone());
-	let auth_heads_ref = auth_heads.iter().map(Borrow::borrow);
+	let auth_heads = state_ids.iter().map(Borrow::borrow);
 
 	let into_federation_format = |pdu| {
 		services
@@ -303,7 +313,7 @@ async fn create_join_event(
 
 	let auth_chain_ids: HashSet<OwnedEventId> = services
 		.auth_chain
-		.event_ids_iter(room_id, &room_version, auth_heads_ref)
+		.event_ids_iter(room_id, &room_version, auth_heads)
 		.try_collect()
 		.await?;
 
