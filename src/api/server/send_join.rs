@@ -15,14 +15,14 @@ use ruma::{
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
 	Err, Result, at, err,
-	matrix::{Event, event::gen_event_id_canonical_json},
+	matrix::event::gen_event_id_canonical_json,
 	utils::{
 		BoolExt,
-		stream::{BroadbandExt, IterStream, ReadyExt, TryBroadbandExt},
+		stream::{BroadbandExt, IterStream, TryBroadbandExt},
 	},
 	warn,
 };
-use tuwunel_service::Services;
+use tuwunel_service::{Services, rooms::short::ShortStateKey};
 
 use crate::Ruma;
 
@@ -197,38 +197,33 @@ async fn create_join_event(
 		.shared();
 	// Filter out members if omit_members is true
 	let filtered_state_ids = if omit_members {
-		let joining_user_shortstatekey = services
+		let joining_user_ssk = services
 			.short
 			.get_shortstatekey(&StateEventType::RoomMember, state_key.as_str())
 			.await
 			.ok();
 
-		// Fetch up to 5 heroes to include their member events
-		// MSC3706 / MSC3943: Heroes' member events should be included.
-		let heroes_ssks = services
-			.state_accessor
-			.room_state_type_pdus(room_id, &StateEventType::RoomMember)
-			.ready_filter_map(Result::ok)
-			.ready_filter_map(|pdu| pdu.state_key().map(ToOwned::to_owned))
-			.take(5)
-			.broad_filter_map(|u| async move {
-				services
-					.short
-					.get_shortstatekey(&StateEventType::RoomMember, u.as_str())
-					.await
-					.ok()
-			})
-			.collect::<Vec<_>>()
-			.await
-			.into_iter()
-			.collect::<HashSet<_>>();
-
 		state_ids
 			.clone()
 			.then(move |state| {
-				let joining_user_ssk = joining_user_shortstatekey;
-				let heroes_ssks = heroes_ssks;
+				let joining_user_ssk = joining_user_ssk;
 				async move {
+					// Detect heroes from the members already in the room state
+					let heroes_ssks: HashSet<ShortStateKey> = state
+						.iter()
+						.stream()
+						.broad_filter_map(|&(ssk, _)| async move {
+							let (et, _) = services
+								.short
+								.get_statekey_from_short(ssk)
+								.await
+								.ok()?;
+							(et == StateEventType::RoomMember).then_some(ssk)
+						})
+						.take(5)
+						.collect()
+						.await;
+
 					state
 						.iter()
 						.stream()
@@ -236,23 +231,18 @@ async fn create_join_event(
 							let joining_user_ssk = joining_user_ssk;
 							let heroes_ssks = heroes_ssks.clone();
 							let eid = eid.clone();
-							services
-								.short
-								.get_statekey_from_short(ssk)
-								.map(move |res| {
-									let keep = res
-										.map(|(et, _)| {
-											// Keep if not a member event
-											et != StateEventType::RoomMember
-											// or if it's the joining user's member event
-												|| Some(ssk) == joining_user_ssk
-											// or if it's a room hero's member event
-												|| heroes_ssks.contains(&ssk)
-										})
-										.unwrap_or(true);
+							async move {
+								let (et, _) = services
+									.short
+									.get_statekey_from_short(ssk)
+									.await
+									.ok()?;
+								let keep = et != StateEventType::RoomMember
+									|| Some(ssk) == joining_user_ssk
+									|| heroes_ssks.contains(&ssk);
 
-									keep.then_some(eid)
-								})
+								keep.then_some(eid)
+							}
 						})
 						.collect::<Vec<OwnedEventId>>()
 						.await
@@ -300,7 +290,13 @@ async fn create_join_event(
 
 	// Wait for state gather which the remaining operations depend on.
 	let state_ids = filtered_state_ids.await;
-	let auth_heads = state_ids.iter().map(Borrow::borrow);
+
+	// Use both the filtered state and the new join event as auth heads.
+	// MSC3706 requires the auth chain of the join event itself to be included.
+	let mut auth_heads = state_ids.clone();
+	auth_heads.push(event_id.clone());
+	let auth_heads_ref = auth_heads.iter().map(Borrow::borrow);
+
 	let into_federation_format = |pdu| {
 		services
 			.federation
@@ -310,7 +306,7 @@ async fn create_join_event(
 
 	let auth_chain_ids: HashSet<OwnedEventId> = services
 		.auth_chain
-		.event_ids_iter(room_id, &room_version, auth_heads)
+		.event_ids_iter(room_id, &room_version, auth_heads_ref)
 		.try_collect()
 		.await?;
 
@@ -321,15 +317,14 @@ async fn create_join_event(
 		.stream()
 		.map(Ok::<_, tuwunel_core::Error>)
 		.broad_and_then(async |event_id| {
-			if omit_members
-				&& !state_ids_set.contains(&event_id)
-				&& let Ok(pdu_event) = services.timeline.get_pdu(&event_id).await
-				&& *pdu_event.kind() == StateEventType::RoomMember.into()
-			{
+			// MSC3706: Any events returned within state can be omitted from auth_chain.
+			if omit_members && state_ids_set.contains(&event_id) {
 				return Ok(None);
 			}
-			let json_result = services.timeline.get_pdu_json(&event_id).await;
-			match json_result {
+
+			let json_res = services.timeline.get_pdu_json(&event_id).await;
+
+			match json_res {
 				| Ok(pdu) => into_federation_format(pdu).await.map(Some),
 				| Err(e) => Err(e),
 			}
