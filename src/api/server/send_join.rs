@@ -16,10 +16,7 @@ use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
 	Err, Result, at, err,
 	matrix::event::gen_event_id_canonical_json,
-	utils::{
-		BoolExt,
-		stream::{BroadbandExt, IterStream, TryBroadbandExt},
-	},
+	utils::stream::{BroadbandExt, IterStream, TryBroadbandExt},
 	warn,
 };
 use tuwunel_service::{Services, rooms::short::ShortStateKey};
@@ -406,20 +403,22 @@ pub(crate) async fn create_join_event_v2_route(
 		))));
 	}
 
-	// Get the servers in the room if omit_members is true
-	let server_in_room = body.omit_members.then_async(|| {
-		services
-			.state_cache
-			.room_servers(&body.room_id)
-			.map(ToString::to_string)
-			.collect()
-	});
+	// Get the servers in the room BEFORE the join
+	let servers_in_room = if body.omit_members {
+		Some(
+			services
+				.state_cache
+				.room_servers(&body.room_id)
+				.map(ToString::to_string)
+				.collect::<Vec<_>>()
+				.await,
+		)
+	} else {
+		None
+	};
 
-	let room_state =
-		create_join_event(&services, body.origin(), &body.room_id, &body.pdu, body.omit_members);
-
-	let (servers_in_room, create_join_event::v1::RoomState { auth_chain, state, event }) =
-		futures::future::try_join(server_in_room.map(Ok), room_state)
+	let create_join_event::v1::RoomState { auth_chain, state, event } =
+		create_join_event(&services, body.origin(), &body.room_id, &body.pdu, body.omit_members)
 			.boxed()
 			.await?;
 
