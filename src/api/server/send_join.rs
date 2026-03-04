@@ -308,33 +308,34 @@ async fn create_join_event(
 			.map(Ok)
 	};
 
-	// Get the auth chain for the new server.
-	let mut auth_chain_ids: HashSet<OwnedEventId> = services
+	let auth_chain_ids: HashSet<OwnedEventId> = services
 		.auth_chain
 		.event_ids_iter(room_id, &room_version, auth_heads)
 		.try_collect()
 		.await?;
 
-	// Remove member events from the auth chain if omit_members is true
-	if omit_members {
-		for id in &state_ids {
-			auth_chain_ids.remove(id);
-		}
-	}
+	let state_ids_set: HashSet<OwnedEventId> = state_ids.iter().cloned().collect();
 
 	let auth_chain = auth_chain_ids
 		.into_iter()
 		.stream()
 		.map(Ok::<_, tuwunel_core::Error>)
 		.broad_and_then(async |event_id| {
-			services
-				.timeline
-				.get_pdu_json(&event_id)
-				.and_then(into_federation_format)
-				.await
+			if omit_members && !state_ids_set.contains(&event_id) {
+				if let Ok(pdu_event) = services.timeline.get_pdu(&event_id).await {
+					if *pdu_event.kind() == StateEventType::RoomMember.into() {
+						return Ok(None);
+					}
+				}
+			}
+			let json_result = services.timeline.get_pdu_json(&event_id).await;
+			match json_result {
+				| Ok(pdu) => into_federation_format(pdu).await.map(Some),
+				| Err(e) => Err(e),
+			}
 		})
+		.try_filter_map(|opt_event| futures::future::ready(Ok(opt_event)))
 		.try_collect();
-
 	let state = state_ids
 		.iter()
 		.try_stream()
