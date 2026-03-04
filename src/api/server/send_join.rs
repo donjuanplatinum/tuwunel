@@ -321,12 +321,12 @@ async fn create_join_event(
 		.stream()
 		.map(Ok::<_, tuwunel_core::Error>)
 		.broad_and_then(async |event_id| {
-			if omit_members && !state_ids_set.contains(&event_id) {
-				if let Ok(pdu_event) = services.timeline.get_pdu(&event_id).await {
-					if *pdu_event.kind() == StateEventType::RoomMember.into() {
-						return Ok(None);
-					}
-				}
+			if omit_members
+				&& !state_ids_set.contains(&event_id)
+				&& let Ok(pdu_event) = services.timeline.get_pdu(&event_id).await
+				&& *pdu_event.kind() == StateEventType::RoomMember.into()
+			{
+				return Ok(None);
 			}
 			let json_result = services.timeline.get_pdu_json(&event_id).await;
 			match json_result {
