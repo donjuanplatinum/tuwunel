@@ -193,7 +193,7 @@ async fn create_join_event(
 		.collect::<Vec<_>>()
 		.boxed()
 		.shared();
-	// Filter out members if omit_members is true
+	// Filter out members if omit_members is true (MSC3706 + MSC3943)
 	let filtered_state_ids = if omit_members {
 		let joining_user_ssk = services
 			.short
@@ -206,35 +206,95 @@ async fn create_join_event(
 			.then(move |state| {
 				let joining_user_ssk = joining_user_ssk;
 				async move {
-					let heroes_ssks: HashSet<ShortStateKey> = state
+					// MSC3943: Only include heroes when the room has no name and no
+					// canonical alias (matching Synapse's behavior in PR #14442).
+					let has_name = state
 						.iter()
 						.stream()
-						.broad_filter_map(|&(ssk, ref eid)| async move {
-							let (et, key) = services.short.get_statekey_from_short(ssk).await.ok()?;
-							if et != StateEventType::RoomMember {
-								return None;
-							}
-
-							// Only consider JOINED or INVITED members as heroes
-							let pdu = services.timeline.get_pdu(eid).await.ok()?;
-							let content: RoomMemberEventContent = serde_json::from_str(pdu.content().get()).ok()?;
-
-							if matches!(content.membership, MembershipState::Join | MembershipState::Invite) {
-								Some((ssk, key))
-							} else {
-								None
-							}
+						.any(|&(ssk, _)| async move {
+							services
+								.short
+								.get_statekey_from_short(ssk)
+								.await
+								.is_ok_and(|(et, sk)| {
+									et == StateEventType::RoomName && sk.is_empty()
+								})
 						})
-						// Sort by MXID string to ensure deterministic selection across servers 
-						// (Synapse uses oldest first, but MXID sorting is a safe tiebreaker)
-						.collect::<Vec<_>>()
-						.await
-						.into_iter()
-						.sorted_by_key(|(_, key)| key.clone())
-						.map(|(ssk, _)| ssk)
-						.take(5)
-						.collect();
+						.await;
 
+					let has_alias = state
+						.iter()
+						.stream()
+						.any(|&(ssk, _)| async move {
+							services
+								.short
+								.get_statekey_from_short(ssk)
+								.await
+								.is_ok_and(|(et, sk)| {
+									et == StateEventType::RoomCanonicalAlias && sk.is_empty()
+								})
+						})
+						.await;
+
+					// Collect hero SSKs only if room has no name and no canonical alias
+					let heroes_ssks: HashSet<ShortStateKey> = if !has_name && !has_alias {
+						// Classify members by membership state, excluding the joining
+						// user (matching Synapse's extract_heroes_from_room_summary).
+						let mut joined_invited: Vec<(ShortStateKey, String)> = Vec::new();
+						let mut left_banned: Vec<(ShortStateKey, String)> = Vec::new();
+
+						for &(ssk, ref eid) in &state {
+							let Ok((et, key)) = services.short.get_statekey_from_short(ssk).await
+							else {
+								continue;
+							};
+							if et != StateEventType::RoomMember {
+								continue;
+							}
+							// Exclude the joining user from heroes
+							if Some(ssk) == joining_user_ssk {
+								continue;
+							}
+							let Ok(pdu) = services.timeline.get_pdu(eid).await else {
+								continue;
+							};
+							let Ok(content) = serde_json::from_str::<RoomMemberEventContent>(
+								pdu.content().get(),
+							) else {
+								continue;
+							};
+							match content.membership {
+								| MembershipState::Join | MembershipState::Invite => {
+									joined_invited.push((ssk, key.to_string()));
+								},
+								| MembershipState::Leave | MembershipState::Ban => {
+									left_banned.push((ssk, key.to_string()));
+								},
+								| _ => {},
+							}
+						}
+
+						// Synapse: use joined+invited if any, otherwise fall back to
+						// left+banned. Sort by MXID, take first 5.
+						let heroes = if !joined_invited.is_empty() {
+							joined_invited
+						} else {
+							left_banned
+						};
+
+						heroes
+							.into_iter()
+							.sorted_by_key(|(_, key)| key.clone())
+							.map(|(ssk, _)| ssk)
+							.take(5)
+							.collect()
+					} else {
+						HashSet::new()
+					};
+
+					// Filter state: keep all non-member events, the joining user's
+					// member event, and hero member events. If get_statekey_from_short
+					// fails, keep the event (safe default, matching original behavior).
 					state
 						.iter()
 						.stream()
@@ -243,14 +303,16 @@ async fn create_join_event(
 							let heroes_ssks = heroes_ssks.clone();
 							let eid = eid.clone();
 							async move {
-								let (et, _) = services
+								let keep = services
 									.short
 									.get_statekey_from_short(ssk)
 									.await
-									.ok()?;
-								let keep = et != StateEventType::RoomMember
-									|| Some(ssk) == joining_user_ssk
-									|| heroes_ssks.contains(&ssk);
+									.map(|(et, _)| {
+										et != StateEventType::RoomMember
+											|| Some(ssk) == joining_user_ssk || heroes_ssks
+											.contains(&ssk)
+									})
+									.unwrap_or(true); // safe default: keep unknown events
 
 								keep.then_some(eid)
 							}
