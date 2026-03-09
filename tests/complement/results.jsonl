@@ -699,7 +699,7 @@
 {"Action":"pass","Test":"TestSearch/parallel/Search_results_with_recent_ordering_do_not_include_redacted_events"}
 {"Action":"pass","Test":"TestSearch/parallel/Search_works_across_an_upgraded_room_and_its_predecessor"}
 {"Action":"fail","Test":"TestSendAndFetchMessage"}
-{"Action":"skip","Test":"TestSendJoinPartialStateResponse"}
+{"Action":"pass","Test":"TestSendJoinPartialStateResponse"}
 {"Action":"pass","Test":"TestSendMessageWithTxn"}
 {"Action":"pass","Test":"TestServerCapabilities"}
 {"Action":"skip","Test":"TestServerNotices"}

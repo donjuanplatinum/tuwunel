@@ -14,7 +14,7 @@ use ruma::{
 };
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
-	Err, Result, at, err,
+	Err, Result, at, debug, err,
 	itertools::Itertools,
 	matrix::{Event, event::gen_event_id_canonical_json},
 	utils::stream::{BroadbandExt, IterStream, TryBroadbandExt},
@@ -391,11 +391,14 @@ async fn create_join_event(
 				return Ok(None);
 			}
 
-			let json_res = services.timeline.get_pdu_json(&event_id).await;
+			let json = services.timeline.get_pdu_json(&event_id).await;
 
-			match json_res {
+			match json {
 				| Ok(pdu) => into_federation_format(pdu).await.map(Some),
-				| Err(e) => Err(e),
+				| Err(e) => {
+					debug!(?event_id, "auth chain event not found: {e}");
+					Ok(None)
+				},
 			}
 		})
 		.try_filter_map(|opt_event| futures::future::ready(Ok(opt_event)))
